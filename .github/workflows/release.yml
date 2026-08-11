@@ -86,13 +86,34 @@ jobs:
 
       - name: Publish to Maven Central
         if: steps.guard.outputs.skip != 'true'
-        run: ./gradlew publishToMavenCentral --no-daemon
         env:
           ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
-          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
+          SIGNING_KEY_RAW: ${{ secrets.SIGNING_KEY }}
           ORG_GRADLE_PROJECT_signingInMemoryKeyId: ${{ secrets.SIGNING_KEY_ID }}
           ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Secrets may be multiline armored ASCII, or a single line with \n escapes
+          # (as in ~/.gradle/gradle.properties). Env vars do not unescape \n.
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+
+          raw = os.environ.get("SIGNING_KEY_RAW", "")
+          if not raw.strip():
+              raise SystemExit("SIGNING_KEY secret is empty")
+          key = raw.strip().strip('"').strip("'")
+          if "\n" not in key and "\\n" in key:
+              key = key.replace("\\n", "\n")
+          if "BEGIN PGP PRIVATE KEY BLOCK" not in key:
+              raise SystemExit("SIGNING_KEY does not look like an armored private key")
+          Path("/tmp/signing.key.asc").write_text(key)
+          print("signing key normalized ok, lines=", len(key.splitlines()))
+          PY
+          export ORG_GRADLE_PROJECT_signingInMemoryKey="$(cat /tmp/signing.key.asc)"
+          rm -f /tmp/signing.key.asc
+          ./gradlew publishToMavenCentral --no-daemon
 
       - name: GitHub Release
         if: steps.guard.outputs.skip != 'true'
@@ -145,13 +166,32 @@ jobs:
 
       - name: Publish to Maven Central
         if: steps.exists.outputs.exists != 'true'
-        run: ./gradlew publishToMavenCentral --no-daemon
         env:
           ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
-          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
+          SIGNING_KEY_RAW: ${{ secrets.SIGNING_KEY }}
           ORG_GRADLE_PROJECT_signingInMemoryKeyId: ${{ secrets.SIGNING_KEY_ID }}
           ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+
+          raw = os.environ.get("SIGNING_KEY_RAW", "")
+          if not raw.strip():
+              raise SystemExit("SIGNING_KEY secret is empty")
+          key = raw.strip().strip('"').strip("'")
+          if "\n" not in key and "\\n" in key:
+              key = key.replace("\\n", "\n")
+          if "BEGIN PGP PRIVATE KEY BLOCK" not in key:
+              raise SystemExit("SIGNING_KEY does not look like an armored private key")
+          Path("/tmp/signing.key.asc").write_text(key)
+          print("signing key normalized ok, lines=", len(key.splitlines()))
+          PY
+          export ORG_GRADLE_PROJECT_signingInMemoryKey="$(cat /tmp/signing.key.asc)"
+          rm -f /tmp/signing.key.asc
+          ./gradlew publishToMavenCentral --no-daemon
 
       - name: GitHub Release
         uses: softprops/action-gh-release@v2
