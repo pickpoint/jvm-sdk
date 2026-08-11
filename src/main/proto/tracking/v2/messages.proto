@@ -151,8 +151,10 @@ message Subscribed {
   string device_uid = 1;
   string track_uid = 2;
   LatLng last_location = 3;
+  // Planned route (if any). Live trail is LocationAdded only — not a full history dump.
   repeated LatLng route = 4;
-  repeated LatLng locations = 5;
+  reserved 5;
+  reserved "locations";
   double estimated_distance = 6;
   double estimated_duration = 7;
   string start_location_name = 8;
