@@ -1,0 +1,161 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  # Auto-patch on main when HEAD is not already tagged.
+  # NOTE: pushes made with GITHUB_TOKEN do not trigger new workflows, so we
+  # publish + create the GitHub Release in this same job.
+  release-main:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip if release commit or already tagged
+        id: guard
+        run: |
+          msg=$(git log -1 --pretty=%B)
+          if echo "$msg" | grep -q '\[skip release\]'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping: commit has [skip release]"
+            exit 0
+          fi
+          if git describe --exact-match --tags HEAD 2>/dev/null | grep -q '^v'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping: HEAD already tagged"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.guard.outputs.skip != 'true'
+
+      - name: Test
+        if: steps.guard.outputs.skip != 'true'
+        run: ./gradlew test --no-daemon
+
+      - name: Bump patch, commit, tag
+        if: steps.guard.outputs.skip != 'true'
+        id: bump
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          ver=$(python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("VERSION")
+          text = path.read_text().strip()
+          m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", text)
+          if not m:
+              raise SystemExit(f"invalid VERSION: {text!r}")
+          major, minor, patch = map(int, m.groups())
+          new = f"{major}.{minor}.{patch + 1}"
+          path.write_text(new + "\n")
+          print(new)
+          PY
+          )
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          git add VERSION
+          git commit -m "chore: release v${ver} [skip release]"
+          git tag "v${ver}"
+          git push origin HEAD:main --follow-tags
+
+      - name: Publish to Maven Central
+        if: steps.guard.outputs.skip != 'true'
+        run: ./gradlew publishToMavenCentral --no-daemon
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyId: ${{ secrets.SIGNING_KEY_ID }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_PASSWORD }}
+
+      - name: GitHub Release
+        if: steps.guard.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.bump.outputs.version }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Manual tags (human push). GITHUB_TOKEN tag pushes from release-main do not
+  # reach here — that path publishes above.
+  publish-tag:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Verify tag matches VERSION
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(tr -d '[:space:]' < VERSION)
+          if [ "$tag" != "$ver" ]; then
+            echo "Tag v$tag != VERSION $ver"
+            exit 1
+          fi
+
+      - run: ./gradlew test --no-daemon
+
+      - name: Skip if version already on Maven Central
+        id: exists
+        run: |
+          ver=$(tr -d '[:space:]' < VERSION)
+          if curl -sf "https://repo1.maven.org/maven2/io/pickpoint/pickpoint/${ver}/pickpoint-${ver}.pom" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Version $ver already on Maven Central — skip publish"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to Maven Central
+        if: steps.exists.outputs.exists != 'true'
+        run: ./gradlew publishToMavenCentral --no-daemon
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyId: ${{ secrets.SIGNING_KEY_ID }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_PASSWORD }}
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
