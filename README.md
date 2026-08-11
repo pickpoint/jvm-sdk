@@ -141,8 +141,8 @@ Repo secrets (Settings → Secrets and variables → Actions):
 |--------|--------|
 | `MAVEN_CENTRAL_USERNAME` | Central Portal user token username |
 | `MAVEN_CENTRAL_PASSWORD` | Central Portal user token password |
-| `SIGNING_KEY` | Armored private key (`-----BEGIN PGP PRIVATE KEY BLOCK-----` …). Multiline paste from `gpg --export-secret-keys --armor`, **or** the single-line `\n`-escaped value from `signingInMemoryKey=` in `~/.gradle/gradle.properties` |
-| `SIGNING_KEY_ID` | Last 8 hex chars (e.g. `8869B5C7`) — not the full fingerprint |
+| `SIGNING_KEY` | **Prefer base64** of the armored private key (single line). Example: `gpg --export-secret-keys --armor 03AB60E58869B5C7 \| base64 \| pbcopy`. Also accepts raw armored text. |
+| `SIGNING_KEY_ID` | `8869B5C7` or long id `03AB60E58869B5C7` |
 | `SIGNING_PASSWORD` | GPG key passphrase (same as `signingInMemoryKeyPassword`) |
 
 Skip auto-release on a commit: include `[skip release]` in the message. For a minor/major bump, edit `VERSION` in a PR with `[skip release]`, merge, then tag/push or let the next main push continue from there.
