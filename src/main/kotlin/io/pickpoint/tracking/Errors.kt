@@ -1,10 +1,7 @@
 package io.pickpoint.tracking
 
-import io.pickpoint.tracking.v2.ErrorCode
-import io.pickpoint.tracking.v2.Error as WireError
-
 open class TrackingException(
-    val code: ErrorCode = ErrorCode.ERROR_CODE_INVALID,
+    val code: ErrorCode = ErrorCode.INVALID,
     message: String = "",
     cause: Throwable? = null,
 ) : RuntimeException(
@@ -13,16 +10,13 @@ open class TrackingException(
 )
 
 fun isAuthError(code: ErrorCode): Boolean =
-    code == ErrorCode.ERROR_CODE_AUTH || code == ErrorCode.ERROR_CODE_UNAUTHORIZED
+    code == ErrorCode.AUTH || code == ErrorCode.UNAUTHORIZED
 
-fun isFatalResumeError(code: ErrorCode): Boolean = when (code) {
-    ErrorCode.ERROR_CODE_TRACK_NOT_FOUND,
-    ErrorCode.ERROR_CODE_FENCED,
-    ErrorCode.ERROR_CODE_AUTH,
-    ErrorCode.ERROR_CODE_UNAUTHORIZED,
-    -> true
-    else -> false
-}
+fun isFatalResumeError(code: ErrorCode): Boolean =
+    code == ErrorCode.TRACK_NOT_FOUND || code == ErrorCode.AUTH
+
+fun isRetryResumeError(code: ErrorCode): Boolean =
+    code == ErrorCode.FENCED || code == ErrorCode.TRY_AGAIN
 
 fun errorFromWire(err: WireError): TrackingException =
     TrackingException(err.code, err.message.ifEmpty { err.code.name })

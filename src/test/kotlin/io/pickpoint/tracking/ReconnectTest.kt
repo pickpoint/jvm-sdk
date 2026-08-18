@@ -1,11 +1,5 @@
 package io.pickpoint.tracking
 
-import io.pickpoint.tracking.v2.ClientMsg
-import io.pickpoint.tracking.v2.ErrorCode
-import io.pickpoint.tracking.v2.LatLng
-import io.pickpoint.tracking.v2.Relocate
-import io.pickpoint.tracking.v2.ServerMsg
-import io.pickpoint.tracking.v2.TrackStarted
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -37,21 +31,21 @@ class ReconnectTest {
             )
             try {
                 val uid = c.startTrack()
-                c.publish(LatLng.newBuilder().setLatitude(1.0).setLongitude(2.0).build())
+                c.publish(LatLng(1.0, 2.0))
                 Thread.sleep(25)
-                c.publish(LatLng.newBuilder().setLatitude(3.0).setLongitude(4.0).build())
+                c.publish(LatLng(3.0, 4.0))
                 assertEquals(2, c.clientSeq())
 
                 c.forceDisconnectForTest()
                 waitFor(3000) { c.state() == ConnectionState.RECONNECTING }
                 release.countDown()
 
-                val resume = ms.waitMsg { it.bodyCase == ClientMsg.BodyCase.RESUME }
-                assertEquals(uid, resume.resume.trackUid)
-                assertEquals(2, resume.resume.lastClientSeq)
+                val resume = ms.waitMsg { it.resume != null }
+                assertEquals(uid, resume.resume!!.trackUid)
+                assertEquals(2, resume.resume!!.lastSeq)
 
                 waitFor(5000) { c.state() == ConnectionState.OPEN }
-                assertEquals(1, ms.countMessages { it.bodyCase == ClientMsg.BodyCase.TRACK_START })
+                assertEquals(1, ms.countMessages { it.trackStart != null })
             } finally {
                 c.close()
             }
@@ -70,16 +64,11 @@ class ReconnectTest {
                     if (idx >= 2) release.await()
                 },
                 onMsg = { msg, conn ->
-                    when (msg.bodyCase) {
-                        ClientMsg.BodyCase.TRACK_START ->
-                            conn.send(
-                                ServerMsg.newBuilder()
-                                    .setTrackStarted(TrackStarted.newBuilder().setTrackUid("t-gone"))
-                                    .build(),
-                            )
-                        ClientMsg.BodyCase.RESUME ->
-                            conn.send(serverError(ErrorCode.ERROR_CODE_TRACK_NOT_FOUND, "track expired"))
-                        else -> Unit
+                    when {
+                        msg.trackStart != null ->
+                            conn.send(ServerMsg(trackStarted = TrackStarted("dddddddd-dddd-dddd-dddd-dddddddddddd")))
+                        msg.resume != null ->
+                            conn.send(serverError(ErrorCode.TRACK_NOT_FOUND, "track expired"))
                     }
                 },
             ),
@@ -95,11 +84,11 @@ class ReconnectTest {
             )
             try {
                 c.startTrack()
-                assertEquals("t-gone", c.trackUid())
+                assertEquals("dddddddd-dddd-dddd-dddd-dddddddddddd", c.trackUid())
                 c.forceDisconnectForTest()
                 waitFor(3000) { c.state() == ConnectionState.RECONNECTING }
                 release.countDown()
-                ms.waitMsg { it.bodyCase == ClientMsg.BodyCase.RESUME }
+                ms.waitMsg { it.resume != null }
                 waitFor(5000) { c.trackUid().isEmpty() }
             } finally {
                 c.close()
@@ -116,10 +105,7 @@ class ReconnectTest {
             val gateway = startMockOpts(
                 MockOpts(
                     auto = false,
-                    relocateOnConnect = Relocate.newBuilder()
-                        .setEndpoint(target.url)
-                        .setRetryAfterMs(10)
-                        .build(),
+                    relocateOnConnect = Relocate(endpoint = target.url, retryAfterMs = 10),
                 ),
             )
             try {
@@ -133,7 +119,7 @@ class ReconnectTest {
                 try {
                     assertEquals(ConnectionState.OPEN, c.state())
                     assertTrue(target.connCount() >= 1)
-                    assertEquals("track-mock-1", c.startTrack())
+                    assertEquals(MOCK_TRACK_UID, c.startTrack())
                 } finally {
                     c.close()
                 }
@@ -169,16 +155,13 @@ class ReconnectTest {
                 c.startTrack()
                 c.forceDisconnectForTest()
                 waitFor(3000) { c.state() == ConnectionState.RECONNECTING }
-                val (seq, ok) = c.publish(LatLng.newBuilder().setLatitude(9.0).setLongitude(9.0).build())
+                val (seq, ok) = c.publish(LatLng(9.0, 9.0))
                 assertTrue(ok)
-                assertEquals(1, seq)
+                assertEquals(0, seq)
                 release.countDown()
-                ms.waitMsg { it.bodyCase == ClientMsg.BodyCase.RESUME }
-                ms.waitMsg {
-                    it.bodyCase == ClientMsg.BodyCase.LOCATION_BATCH ||
-                        it.bodyCase == ClientMsg.BodyCase.LOCATION_ADD
-                }
-                Unit
+                ms.waitMsg { it.resume != null }
+                ms.waitMsg { it.loc != null }
+                waitFor(3000) { c.clientSeq() == 1L }
             } finally {
                 c.close()
             }

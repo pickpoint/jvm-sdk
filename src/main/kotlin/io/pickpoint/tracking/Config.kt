@@ -3,8 +3,8 @@ package io.pickpoint.tracking
 import java.time.Duration
 
 const val DEFAULT_TRACKING_ENDPOINT: String = "wss://tracking.pickpoint.io"
-const val DEFAULT_WS_PATH: String = "/v2/tracking/ws"
-const val SUBPROTOCOL: String = "tracking.v2.proto"
+const val DEFAULT_WS_PATH: String = "/v2/ws"
+const val SUBPROTOCOL: String = "tracking.v2"
 const val MAX_PUBLISH_HZ: Int = 50
 val MIN_PUBLISH_INTERVAL: Duration = Duration.ofMillis(1000L / MAX_PUBLISH_HZ)
 const val MAX_EVENT_BYTES: Int = 4 * 1024
@@ -12,7 +12,7 @@ const val MAX_EVENT_HZ: Int = 1
 val MIN_EVENT_INTERVAL: Duration = Duration.ofSeconds(1)
 
 enum class Transport {
-    /** Binary protobuf on `/v2/tracking/ws` (default). */
+    /** Binary WebSocket on `/v2/ws` (default). */
     WS,
 }
 
@@ -76,6 +76,7 @@ data class Config(
     val refreshAuth: RefreshAuth? = null,
     val maxQueueSize: Int = 10_000,
     val helloTimeout: Duration = Duration.ofSeconds(10),
+    val subscribe: List<String> = emptyList(),
 ) {
     class Builder {
         private var endpoint: String = DEFAULT_TRACKING_ENDPOINT
@@ -90,6 +91,7 @@ data class Config(
         private var refreshAuth: RefreshAuth? = null
         private var maxQueueSize: Int = 10_000
         private var helloTimeout: Duration = Duration.ofSeconds(10)
+        private var subscribe: List<String> = emptyList()
 
         fun endpoint(v: String) = apply { endpoint = v }
         fun transport(v: Transport) = apply { transport = v }
@@ -103,10 +105,11 @@ data class Config(
         fun refreshAuth(v: RefreshAuth?) = apply { refreshAuth = v }
         fun maxQueueSize(v: Int) = apply { maxQueueSize = v }
         fun helloTimeout(v: Duration) = apply { helloTimeout = v }
+        fun subscribe(v: List<String>) = apply { subscribe = v }
         fun build() = Config(
             endpoint, transport, device, listener, wsPath, disableReconnect,
             reconnectMinDelay, reconnectMaxDelay, reconnectMaxAttempts,
-            refreshAuth, maxQueueSize, helloTimeout,
+            refreshAuth, maxQueueSize, helloTimeout, subscribe,
         )
     }
 

@@ -1,10 +1,5 @@
 package io.pickpoint.tracking
 
-import io.pickpoint.tracking.v2.ClientMsg
-import io.pickpoint.tracking.v2.ErrorCode
-import io.pickpoint.tracking.v2.LatLng
-import io.pickpoint.tracking.v2.LocationAdded
-import io.pickpoint.tracking.v2.ServerMsg
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -29,16 +24,16 @@ class TrackingClientTest {
                 ),
             )
             try {
-                c.startTrack(LatLng.newBuilder().setLatitude(1.0).setLongitude(2.0).build())
+                c.startTrack(LatLng(1.0, 2.0))
                 var accepted = 0
                 repeat(MAX_PUBLISH_HZ * 3) { i ->
-                    val (_, ok) = c.publish(LatLng.newBuilder().setLatitude(i.toDouble()).setLongitude(0.0).build())
+                    val (_, ok) = c.publish(LatLng(i.toDouble(), 0.0))
                     if (ok) accepted++
                 }
                 assertEquals(1, accepted)
                 assertEquals(1, c.clientSeq())
                 Thread.sleep(MIN_PUBLISH_INTERVAL.toMillis() + 5)
-                val (seq, ok) = c.publish(LatLng.newBuilder().setLatitude(9.0).setLongitude(9.0).build())
+                val (seq, ok) = c.publish(LatLng(9.0, 9.0))
                 assertTrue(ok)
                 assertEquals(2, seq)
             } finally {
@@ -87,17 +82,12 @@ class TrackingClientTest {
                 ),
             )
             try {
-                val uid = c.startTrack(LatLng.newBuilder().setLatitude(1.0).setLongitude(1.0).build())
-                assertTrue(c.publish(LatLng.newBuilder().setLatitude(2.0).setLongitude(2.0).build()).second)
-                withTimeout(2000) {
-                    while (true) {
-                        val msg = c.recv()
-                        if (msg.bodyCase == ServerMsg.BodyCase.LOCATION_ADDED) break
-                    }
-                }
+                val uid = c.startTrack(LatLng(1.0, 1.0))
+                assertTrue(c.publish(LatLng(2.0, 2.0)).second)
+                ms.waitMsg { it.loc != null }
                 val acked = c.resume(uid, 1)
                 assertEquals(0, acked)
-                ms.waitMsg { it.bodyCase == ClientMsg.BodyCase.RESUME }
+                ms.waitMsg { it.resume != null }
             } finally {
                 c.close()
             }
@@ -109,19 +99,13 @@ class TrackingClientTest {
     @Test
     fun listenerSubscribeAndLocation() = runBlocking {
         val ms = startMock(auto = true) { msg, conn ->
-            if (msg.bodyCase == ClientMsg.BodyCase.SUBSCRIBE) {
+            if (msg.subscribe != null) {
                 Thread {
                     Thread.sleep(20)
                     conn.send(
-                        ServerMsg.newBuilder()
-                            .setLocationAdded(
-                                LocationAdded.newBuilder()
-                                    .setDeviceUid(msg.subscribe.deviceUid)
-                                    .setTrackUid("t1")
-                                    .setClientSeq(3)
-                                    .setPoint(LatLng.newBuilder().setLatitude(1.5).setLongitude(2.5)),
-                            )
-                            .build(),
+                        ServerMsg(
+                            loc = ServerLoc(1, 3, LatLng(1.5, 2.5)),
+                        ),
                     )
                 }.start()
             }
@@ -135,16 +119,16 @@ class TrackingClientTest {
                 ),
             )
             try {
-                c.subscribe("device-1")
+                c.subscribe(MOCK_DEVICE_UID)
                 withTimeout(3000) {
                     while (true) {
                         val msg = c.recv()
-                        when (msg.bodyCase) {
-                            ServerMsg.BodyCase.LOCATION_ADDED -> {
-                                assertEquals(1.5, msg.locationAdded.point.latitude, 1e-9)
+                        when {
+                            msg.loc != null -> {
+                                assertEquals(1.5, msg.loc.point.latitude, 1e-9)
                                 return@withTimeout
                             }
-                            ServerMsg.BodyCase.SUBSCRIBED -> continue
+                            msg.subscribed != null -> continue
                             else -> continue
                         }
                     }
@@ -160,8 +144,8 @@ class TrackingClientTest {
     @Test
     fun authErrorWithoutRefreshCloses() = runBlocking {
         val ms = startMock(auto = false) { msg, conn ->
-            if (msg.bodyCase == ClientMsg.BodyCase.TRACK_START) {
-                conn.send(serverError(ErrorCode.ERROR_CODE_AUTH, "bad creds"))
+            if (msg.trackStart != null) {
+                conn.send(serverError(ErrorCode.AUTH, "bad creds"))
             }
         }
         try {
@@ -177,7 +161,7 @@ class TrackingClientTest {
                 val ex = assertThrows(TrackingException::class.java) {
                     runBlocking { c.startTrack() }
                 }
-                assertEquals(ErrorCode.ERROR_CODE_AUTH, ex.code)
+                assertEquals(ErrorCode.AUTH, ex.code)
                 waitFor(3000) { c.state() == ConnectionState.CLOSED }
             } finally {
                 c.close()
@@ -196,8 +180,8 @@ class TrackingClientTest {
                 auto = false,
                 beforeHello = { _, _ -> hellos.incrementAndGet() },
                 onMsg = { msg, conn ->
-                    if (msg.bodyCase == ClientMsg.BodyCase.TRACK_START) {
-                        conn.send(serverError(ErrorCode.ERROR_CODE_UNAUTHORIZED, "expired"))
+                    if (msg.trackStart != null) {
+                        conn.send(serverError(ErrorCode.UNAUTHORIZED, "expired"))
                     }
                 },
             ),

@@ -16,8 +16,7 @@ Built for maps, delivery, logistics, and anything that needs places, routes, or 
 | Package | Role |
 |---------|------|
 | `io.pickpoint` | HTTP: geocode, search, routing, devices, mint |
-| `io.pickpoint.tracking` | Realtime tracks (WebSocket, `tracking.v2.proto`) |
-| `io.pickpoint.tracking.v2` | Generated protobuf messages |
+| `io.pickpoint.tracking` | Live GPS over WebSocket (`tracking.v2`) |
 
 Apache-2.0. Siblings: [go-sdk](https://github.com/pickpoint/go-sdk), [python-sdk](https://github.com/pickpoint/python-sdk), [@pickpoint/sdk](https://github.com/pickpoint/pickpoint-js). Wire schema: [pickpoint-proto](https://github.com/pickpoint/pickpoint-proto).
 
@@ -87,6 +86,14 @@ Geocoding soft-fails non-auth 4xx to empty/`null` (batch-friendly). Address / ro
 
 ## Tracking — `io.pickpoint.tracking`
 
+Live GPS is a **separate** WebSocket session: `wss://tracking.pickpoint.io/v2/ws`, subprotocol `tracking.v2`. It is not the HTTP `Client`.
+
+A dropped socket is not a new trip. The SDK reconnects and **Resumes** the same `track_uid`.
+
+First `publish` starts the trip if none is live. `close` sends `TrackStop` then hangs up. Call `startTrack` only to supersede (new order / `TRACK_NOT_FOUND`) or to set a route.
+
+### Device (publisher)
+
 ```kotlin
 import io.pickpoint.tracking.Config
 import io.pickpoint.tracking.DeviceAuth
@@ -100,13 +107,42 @@ val session = connectBlocking(
     ),
 )
 
-val trackUid = session.startTrackBlocking(latLng(52.52, 13.405))
-session.publishBlocking(latLng(52.521, 13.406))
-session.stopTrackBlocking()
-session.closeBlocking()
+session.publishBlocking(latLng(55.75, 37.61)) // TrackStart if idle
+session.closeBlocking() // TrackStop + hang up
 ```
 
-Suspend APIs (`connect`, `startTrack`, `publish`, …) are available for coroutine-based apps. Default transport is binary WebSocket with subprotocol `tracking.v2.proto`.
+### Listener (dashboard)
+
+The JWT is the **client-token** `accessToken` — same one as HTTP `clientAuth`. Mint it on your backend with scope `devices`.
+
+```kotlin
+import io.pickpoint.mintClientTokens
+import io.pickpoint.tracking.Config
+import io.pickpoint.tracking.ListenerAuth
+import io.pickpoint.tracking.connectBlocking
+
+val pair = mintClientTokens(
+    io.pickpoint.Config(apiKey = System.getenv("PICKPOINT_API_KEY")),
+    listOf("devices"),
+    600,
+)
+val session = connectBlocking(
+    Config(
+        endpoint = "wss://tracking.pickpoint.io",
+        listener = ListenerAuth(accessToken = pair.accessToken),
+        subscribe = listOf(deviceUid),
+    ),
+)
+
+while (true) {
+    val msg = session.recvBlocking()
+    msg.loc?.let { println("${it.point.latitude} ${it.point.longitude}") }
+}
+```
+
+Coroutine APIs (`connect`, `startTrack`, `publish`, `recv`, …) are the same surface without `Blocking`.
+
+Wire format: [pickpoint-proto](https://github.com/pickpoint/pickpoint-proto).
 
 ---
 
@@ -149,4 +185,3 @@ Skip auto-release on a commit: include `[skip release]` in the message. For a mi
 
 Artifact: `io.pickpoint:pickpoint` (version from `VERSION`).
 
-Proto stubs are generated from `src/main/proto/tracking/v2/messages.proto` (synced from `pickpoint-proto`).

@@ -1,16 +1,5 @@
 package io.pickpoint.tracking
 
-import io.pickpoint.tracking.v2.ClientMsg
-import io.pickpoint.tracking.v2.ErrorCode
-import io.pickpoint.tracking.v2.Hello
-import io.pickpoint.tracking.v2.LocationAdded
-import io.pickpoint.tracking.v2.Relocate
-import io.pickpoint.tracking.v2.ResumeOk
-import io.pickpoint.tracking.v2.ServerMsg
-import io.pickpoint.tracking.v2.Subscribed
-import io.pickpoint.tracking.v2.TrackStarted
-import io.pickpoint.tracking.v2.TrackStopped
-import io.pickpoint.tracking.v2.Error as WireError
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
@@ -26,12 +15,16 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
+const val MOCK_TRACK_UID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+const val MOCK_DEVICE_UID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+const val MOCK_NODE_ID = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+
 class MockConn(val ws: WebSocket) {
     private val lock = Any()
     val messages = mutableListOf<ClientMsg>()
 
     fun send(msg: ServerMsg): Boolean =
-        ws.send(msg.toByteArray().toByteString())
+        ws.send(encodeServerMsg(msg).toByteString())
 
     fun close() {
         try {
@@ -58,6 +51,7 @@ class MockTrackingServer(private val opts: MockOpts) {
     private val server = MockWebServer()
     private val connections = CopyOnWriteArrayList<MockConn>()
     private val connIndex = AtomicInteger()
+    private val nextSub = AtomicInteger(1)
 
     val url: String
         get() = server.url("/").toString().trimEnd('/').replace("http://", "ws://").replace("https://", "wss://")
@@ -119,13 +113,9 @@ class MockTrackingServer(private val opts: MockOpts) {
             connections.add(conn)
             val sendHello = {
                 if (opts.relocateOnConnect != null && idx == 1) {
-                    conn.send(ServerMsg.newBuilder().setRelocate(opts.relocateOnConnect).build())
+                    conn.send(ServerMsg(relocate = opts.relocateOnConnect))
                 } else {
-                    conn.send(
-                        ServerMsg.newBuilder()
-                            .setHello(Hello.newBuilder().setNodeId("mock-1"))
-                            .build(),
-                    )
+                    conn.send(ServerMsg(hello = Hello(PROTOCOL_VERSION, 0, MOCK_NODE_ID)))
                 }
             }
             if (opts.beforeHello != null) {
@@ -140,72 +130,35 @@ class MockTrackingServer(private val opts: MockOpts) {
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
             val msg = try {
-                ClientMsg.parseFrom(bytes.toByteArray())
+                decodeClientMsg(bytes.toByteArray())
             } catch (_: Exception) {
                 return
             }
             conn.record(msg)
             opts.onMsg?.invoke(msg, conn)
             if (!opts.auto) return
-            when (msg.bodyCase) {
-                ClientMsg.BodyCase.TRACK_START ->
+            when {
+                msg.trackStart != null ->
+                    conn.send(ServerMsg(trackStarted = TrackStarted(MOCK_TRACK_UID)))
+                msg.trackStop != null ->
+                    conn.send(ServerMsg(trackStopped = TrackStopped(MOCK_TRACK_UID)))
+                msg.resume != null ->
+                    conn.send(ServerMsg(resumeOk = ResumeOk(msg.resume.trackUid, 0)))
+                msg.loc != null ->
+                    conn.send(ServerMsg(ack = Ack(msg.loc.seq)))
+                msg.subscribe != null -> {
+                    val sub = nextSub.getAndIncrement()
                     conn.send(
-                        ServerMsg.newBuilder()
-                            .setTrackStarted(TrackStarted.newBuilder().setTrackUid("track-mock-1"))
-                            .build(),
+                        ServerMsg(
+                            subscribed = Subscribed(
+                                sub = sub,
+                                deviceUid = msg.subscribe.deviceUid,
+                                trackUid = MOCK_TRACK_UID,
+                                online = true,
+                            ),
+                        ),
                     )
-                ClientMsg.BodyCase.TRACK_STOP ->
-                    conn.send(
-                        ServerMsg.newBuilder()
-                            .setTrackStopped(TrackStopped.newBuilder().setTrackUid(msg.trackStop.trackUid))
-                            .build(),
-                    )
-                ClientMsg.BodyCase.RESUME ->
-                    conn.send(
-                        ServerMsg.newBuilder()
-                            .setResumeOk(
-                                ResumeOk.newBuilder()
-                                    .setTrackUid(msg.resume.trackUid)
-                                    .setLastAckedSeq(0),
-                            )
-                            .build(),
-                    )
-                ClientMsg.BodyCase.LOCATION_ADD ->
-                    conn.send(
-                        ServerMsg.newBuilder()
-                            .setLocationAdded(
-                                LocationAdded.newBuilder()
-                                    .setTrackUid(msg.locationAdd.trackUid)
-                                    .setClientSeq(msg.locationAdd.clientSeq)
-                                    .setPoint(msg.locationAdd.point)
-                                    .setDeviceUid("dev-1"),
-                            )
-                            .build(),
-                    )
-                ClientMsg.BodyCase.LOCATION_BATCH ->
-                    conn.send(
-                        ServerMsg.newBuilder()
-                            .setLocationAdded(
-                                LocationAdded.newBuilder()
-                                    .setTrackUid(msg.locationBatch.trackUid)
-                                    .setClientSeq(msg.locationBatch.clientSeq)
-                                    .setDeviceUid("dev-1"),
-                            )
-                            .build(),
-                    )
-                ClientMsg.BodyCase.SUBSCRIBE ->
-                    conn.send(
-                        ServerMsg.newBuilder()
-                            .setSubscribed(
-                                Subscribed.newBuilder()
-                                    .setDeviceUid(msg.subscribe.deviceUid)
-                                    .setTrackUid("track-mock-1"),
-                            )
-                            .build(),
-                    )
-                ClientMsg.BodyCase.PING ->
-                    conn.send(ServerMsg.newBuilder().setPong(io.pickpoint.tracking.v2.Pong.getDefaultInstance()).build())
-                else -> Unit
+                }
             }
         }
     }
@@ -220,9 +173,7 @@ fun startMockOpts(opts: MockOpts): MockTrackingServer =
     MockTrackingServer(opts).also { it.start() }
 
 fun serverError(code: ErrorCode, message: String): ServerMsg =
-    ServerMsg.newBuilder()
-        .setError(WireError.newBuilder().setCode(code).setMessage(message))
-        .build()
+    ServerMsg(error = WireError(code, message = message))
 
 fun waitFor(timeoutMs: Long = 5000, pred: () -> Boolean) {
     val deadline = System.currentTimeMillis() + timeoutMs

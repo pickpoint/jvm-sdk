@@ -1,18 +1,5 @@
 package io.pickpoint.tracking
 
-import io.pickpoint.tracking.v2.ClientMsg
-import io.pickpoint.tracking.v2.Command
-import io.pickpoint.tracking.v2.CommandAck
-import io.pickpoint.tracking.v2.CommandAckStatus
-import io.pickpoint.tracking.v2.Event
-import io.pickpoint.tracking.v2.LatLng
-import io.pickpoint.tracking.v2.LocationAdd
-import io.pickpoint.tracking.v2.LocationBatch
-import io.pickpoint.tracking.v2.Resume
-import io.pickpoint.tracking.v2.ServerMsg
-import io.pickpoint.tracking.v2.Subscribe
-import io.pickpoint.tracking.v2.TrackStart
-import io.pickpoint.tracking.v2.TrackStop
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -39,7 +26,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Tracking session (device publisher or listener).
- * Binary WebSocket protobuf (`tracking.v2.proto`).
+ * Binary WebSocket `tracking.v2`.
  */
 class TrackingClient internal constructor(
     private var cfg: Config,
@@ -56,10 +43,13 @@ class TrackingClient internal constructor(
     @Volatile private var lastAckedSeq: Long = 0
 
     private val queue = OfflineQueue(cfg.maxQueueSize)
+    private val filter = NoiseFilter()
+    private var unackedFrames = 0
     private val backoff = newBackoff(cfg.reconnectMinDelay, cfg.reconnectMaxDelay, cfg.reconnectMaxAttempts)
     private var nextPublishAt: Instant = Instant.EPOCH
     private var nextEventAt: Instant = Instant.EPOCH
-    private val subscriptions = linkedSetOf<String>()
+    private val subscriptions = linkedMapOf<String, Int>()
+    private val subByHandle = linkedMapOf<Int, String>()
     private val intentional = AtomicBoolean(false)
     private var dialGen: Long = 0
     private var webSocket: WebSocket? = null
@@ -72,19 +62,16 @@ class TrackingClient internal constructor(
     private var resumeWait: CompletableDeferred<Long>? = null
     private var reconnectJob: Job? = null
     private var helloWait: CompletableDeferred<ServerMsg>? = null
+    @Volatile private var starting: Boolean = false
 
     fun state(): ConnectionState = state
     fun trackUid(): String = trackUid
     fun clientSeq(): Long = clientSeq
     fun lastAckedSeq(): Long = lastAckedSeq
 
-    /** Blocking receive of the next server message (Go-style). */
     fun recvBlocking(): ServerMsg = runBlocking { recv() }
-
     suspend fun recv(): ServerMsg = recvCh.receive()
-
     fun recvCommandBlocking(): Command = runBlocking { recvCommand() }
-
     suspend fun recvCommand(): Command = cmdCh.receive()
 
     suspend fun send(msg: ClientMsg) {
@@ -107,15 +94,21 @@ class TrackingClient internal constructor(
         metadata: ByteArray? = null,
     ): String {
         val fut = CompletableDeferred<String>()
-        mutex.withLock { startWait = fut }
-        val start = TrackStart.newBuilder()
-        if (location != null) start.location = stampLatLng(cloneLatLng(location))
-        route.forEach { start.addRoute(stampLatLng(cloneLatLng(it))) }
-        if (metadata != null) start.metadata = com.google.protobuf.ByteString.copyFrom(metadata)
+        mutex.withLock {
+            queue.clear()
+            filter.reset()
+            clientSeq = 0
+            lastAckedSeq = 0
+            starting = true
+            startWait = fut
+        }
         try {
-            send(ClientMsg.newBuilder().setTrackStart(start).build())
+            send(ClientMsg(trackStart = TrackStart(location, route, metadata ?: ByteArray(0))))
         } catch (e: Exception) {
-            mutex.withLock { startWait = null }
+            mutex.withLock {
+                startWait = null
+                starting = false
+            }
             throw e
         }
         return fut.await()
@@ -135,11 +128,7 @@ class TrackingClient internal constructor(
             resumeWait = fut
         }
         try {
-            send(
-                ClientMsg.newBuilder()
-                    .setResume(Resume.newBuilder().setTrackUid(trackUid).setLastClientSeq(lastClientSeq))
-                    .build(),
-            )
+            send(ClientMsg(resume = Resume(trackUid, lastClientSeq)))
         } catch (e: Exception) {
             mutex.withLock { resumeWait = null }
             throw e
@@ -150,41 +139,54 @@ class TrackingClient internal constructor(
     fun resumeBlocking(trackUid: String, lastClientSeq: Long): Long =
         runBlocking { resume(trackUid, lastClientSeq) }
 
-    /**
-     * Publish a location point. Returns `(seq, accepted)`.
-     * Rate-limited to [MAX_PUBLISH_HZ]; queues offline when reconnecting.
-     */
     suspend fun publish(point: LatLng): Pair<Long, Boolean> {
-        val (seq, accepted, uid, open) = mutex.withLock {
-            if (trackUid.isEmpty()) return@withLock PublishPlan(0, false, "", false)
+        val plan = mutex.withLock {
+            if (trackUid.isEmpty() && !starting) {
+                starting = true
+                queue.clear()
+                filter.reset()
+                clientSeq = 0
+                lastAckedSeq = 0
+                return@withLock PublishPlan(0, true, false, null, point)
+            }
             val now = Instant.now()
+            val emitted = filter.push(point) ?: return@withLock PublishPlan(clientSeq, false, false, null)
+            val open = state == ConnectionState.OPEN && webSocket != null && trackUid.isNotEmpty()
+            val windowOk = unackedFrames < MAX_IN_FLIGHT_FRAMES
+            if (!open || !windowOk) {
+                queue.pushStaging(stampLatLng(emitted))
+                return@withLock PublishPlan(clientSeq, true, false, null)
+            }
             if (!canAcceptPublish(nextPublishAt, now, 1)) {
-                return@withLock PublishPlan(clientSeq, false, trackUid, false)
+                return@withLock PublishPlan(clientSeq, false, false, null)
             }
             nextPublishAt = nextPublishAllowedAt(nextPublishAt, now, 1)
             clientSeq += 1
             val s = clientSeq
-            val pt = stampLatLng(cloneLatLng(point))
-            queue.enqueue(s, pt)
-            PublishPlan(s, true, trackUid, state == ConnectionState.OPEN && webSocket != null)
+            queue.pushInFlight(s, emitted)
+            PublishPlan(s, true, true, stripLiveTime(emitted))
         }
-        if (accepted && open) {
+        if (plan.start != null) {
             try {
-                send(
-                    ClientMsg.newBuilder()
-                        .setLocationAdd(
-                            LocationAdd.newBuilder()
-                                .setTrackUid(uid)
-                                .setClientSeq(seq)
-                                .setPoint(stampLatLng(cloneLatLng(point))),
-                        )
-                        .build(),
-                )
+                send(ClientMsg(trackStart = TrackStart(plan.start, emptyList(), ByteArray(0))))
             } catch (_: Exception) {
-                // queued for resume flush
+                mutex.withLock { starting = false }
+                return 0L to false
+            }
+            return 0L to true
+        }
+        if (plan.send && plan.point != null) {
+            try {
+                val frames = encodeInFlightFrames(listOf(QueuedPoint(plan.seq, plan.point)))
+                mutex.withLock { unackedFrames += frames.size }
+                for (f in frames) {
+                    val ws = webSocket ?: break
+                    ws.send(f.toByteString())
+                }
+            } catch (_: Exception) {
             }
         }
-        return seq to accepted
+        return plan.seq to plan.accepted
     }
 
     fun publishBlocking(point: LatLng): Pair<Long, Boolean> = runBlocking { publish(point) }
@@ -195,7 +197,7 @@ class TrackingClient internal constructor(
         val fut = CompletableDeferred<Unit>()
         mutex.withLock { stopWait = fut }
         try {
-            send(ClientMsg.newBuilder().setTrackStop(TrackStop.newBuilder().setTrackUid(uid)).build())
+            send(ClientMsg(trackStop = TrackStop()))
         } catch (e: Exception) {
             mutex.withLock { stopWait = null }
             throw e
@@ -209,51 +211,59 @@ class TrackingClient internal constructor(
         if (payload.size > MAX_EVENT_BYTES) {
             throw TrackingException(message = "event payload exceeds 4 KiB")
         }
-        val (uid, open) = mutex.withLock {
+        val open = mutex.withLock {
             if (trackUid.isEmpty()) throw TrackingException(message = "startTrack() before sendEvent()")
             val now = Instant.now()
             if (nextEventAt != Instant.EPOCH && now.isBefore(nextEventAt)) {
                 return false
             }
             nextEventAt = now.plus(MIN_EVENT_INTERVAL)
-            trackUid to (state == ConnectionState.OPEN && webSocket != null)
+            state == ConnectionState.OPEN && webSocket != null
         }
         if (!open) return true
-        val ev = Event.newBuilder()
-            .setTrackUid(uid)
-            .setPayload(com.google.protobuf.ByteString.copyFrom(payload))
-            .setTimestampMs(System.currentTimeMillis())
-            .build()
-        send(ClientMsg.newBuilder().setEvent(ev).build())
+        send(ClientMsg(event = Event(payload, System.currentTimeMillis())))
         return true
     }
 
     fun sendEventBlocking(payload: ByteArray): Boolean = runBlocking { sendEvent(payload) }
 
     suspend fun subscribe(deviceUid: String) {
-        mutex.withLock { subscriptions.add(deviceUid) }
-        send(ClientMsg.newBuilder().setSubscribe(Subscribe.newBuilder().setDeviceUid(deviceUid)).build())
+        mutex.withLock { subscriptions[deviceUid] = 0 }
+        send(ClientMsg(subscribe = Subscribe(deviceUid, includeEvents = true)))
     }
 
     fun subscribeBlocking(deviceUid: String) = runBlocking { subscribe(deviceUid) }
 
+    suspend fun unsubscribe(sub: Int) {
+        mutex.withLock {
+            val uid = subByHandle.remove(sub)
+            if (uid != null) subscriptions.remove(uid)
+        }
+        send(ClientMsg(unsubscribe = Unsubscribe(sub)))
+    }
+
     suspend fun ackCommand(
         commandId: String,
-        status: CommandAckStatus = CommandAckStatus.COMMAND_ACK_STATUS_OK,
+        status: CommandAckStatus = CommandAckStatus.OK,
         message: String = "",
     ) {
-        val ack = CommandAck.newBuilder().setCommandId(commandId).setStatus(status)
-        if (message.isNotEmpty()) ack.message = message
-        send(ClientMsg.newBuilder().setCommandAck(ack).build())
+        send(ClientMsg(commandAck = CommandAck(commandId, status, message)))
     }
 
     fun ackCommandBlocking(
         commandId: String,
-        status: CommandAckStatus = CommandAckStatus.COMMAND_ACK_STATUS_OK,
+        status: CommandAckStatus = CommandAckStatus.OK,
         message: String = "",
     ) = runBlocking { ackCommand(commandId, status, message) }
 
     suspend fun close() {
+        val uid = trackUid
+        if (uid.isNotEmpty()) {
+            try {
+                send(ClientMsg(trackStop = TrackStop()))
+            } catch (_: Exception) {
+            }
+        }
         mutex.withLock {
             intentional.set(true)
             reconnectJob?.cancel()
@@ -267,7 +277,6 @@ class TrackingClient internal constructor(
 
     fun closeBlocking() = runBlocking { close() }
 
-    /** Test-only: abruptly drop the socket to exercise reconnect. */
     internal fun forceDisconnectForTest() {
         webSocket?.cancel()
     }
@@ -279,6 +288,7 @@ class TrackingClient internal constructor(
             reconnectJob = null
             dialGen += 1
             gen = dialGen
+            unackedFrames = 0
             state = if (state == ConnectionState.OPEN || state == ConnectionState.RECONNECTING) {
                 ConnectionState.RECONNECTING
             } else {
@@ -311,7 +321,7 @@ class TrackingClient internal constructor(
                     decodeServerMsg(bytes.toByteArray())
                 } catch (_: Exception) {
                     return
-                }
+                } ?: return
                 if (!hello.isCompleted) {
                     hello.complete(msg)
                     return
@@ -324,9 +334,7 @@ class TrackingClient internal constructor(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                if (!hello.isCompleted) {
-                    hello.completeExceptionally(t)
-                }
+                if (!hello.isCompleted) hello.completeExceptionally(t)
                 scope.launch { onSocketClosed(gen) }
             }
 
@@ -352,20 +360,25 @@ class TrackingClient internal constructor(
             throw TrackingException(message = "hello timeout", cause = e)
         }
 
-        when (first.bodyCase) {
-            ServerMsg.BodyCase.RELOCATE -> {
+        when {
+            first.relocate != null -> {
                 ws.cancel()
                 handleRelocate(first.relocate, sendResume)
                 return
             }
-            ServerMsg.BodyCase.ERROR -> {
+            first.error != null -> {
                 ws.cancel()
                 throw errorFromWire(first.error)
             }
-            ServerMsg.BodyCase.HELLO -> Unit
+            first.hello != null -> {
+                if (first.hello.version != PROTOCOL_VERSION) {
+                    ws.cancel()
+                    throw TrackingException(message = "unsupported protocol version ${first.hello.version}")
+                }
+            }
             else -> {
                 ws.cancel()
-                throw TrackingException(message = "expected hello, got ${first.bodyCase}")
+                throw TrackingException(message = "expected hello")
             }
         }
 
@@ -383,45 +396,54 @@ class TrackingClient internal constructor(
         resubscribe()
     }
 
-    private data class PublishPlan(val seq: Long, val accepted: Boolean, val uid: String, val open: Boolean)
+    private data class PublishPlan(
+        val seq: Long,
+        val accepted: Boolean,
+        val send: Boolean,
+        val point: LatLng?,
+        val start: LatLng? = null,
+    )
 
     private suspend fun dispatch(msg: ServerMsg) {
-        when (msg.bodyCase) {
-            ServerMsg.BodyCase.RELOCATE -> {
-                scope.launch { handleRelocate(msg.relocate, sendResume = true) }
-            }
-            ServerMsg.BodyCase.RESUME_OK -> {
+        when {
+            msg.relocate != null -> scope.launch { handleRelocate(msg.relocate, sendResume = true) }
+            msg.resumeOk != null -> {
                 val fut = mutex.withLock {
                     if (msg.resumeOk.trackUid.isNotEmpty()) trackUid = msg.resumeOk.trackUid
-                    lastAckedSeq = msg.resumeOk.lastAckedSeq
+                    lastAckedSeq = msg.resumeOk.lastAcked
                     if (clientSeq < lastAckedSeq) clientSeq = lastAckedSeq
                     queue.ackThrough(lastAckedSeq)
+                    unackedFrames = 0
                     val f = resumeWait
                     resumeWait = null
                     f
                 }
-                flushQueue()
-                fut?.complete(msg.resumeOk.lastAckedSeq)
+                resendInFlight()
+                flushStaging()
+                fut?.complete(msg.resumeOk.lastAcked)
                 recvCh.trySend(msg)
             }
-            ServerMsg.BodyCase.TRACK_STARTED -> {
+            msg.trackStarted != null -> {
                 val fut = mutex.withLock {
                     trackUid = msg.trackStarted.trackUid
                     clientSeq = 0
                     lastAckedSeq = 0
-                    queue.clear()
+                    unackedFrames = 0
+                    starting = false
                     val f = startWait
                     startWait = null
                     f
                 }
                 fut?.complete(msg.trackStarted.trackUid)
+                flushStaging()
                 recvCh.trySend(msg)
             }
-            ServerMsg.BodyCase.TRACK_STOPPED -> {
+            msg.trackStopped != null -> {
                 val fut = mutex.withLock {
-                    if (trackUid == msg.trackStopped.trackUid) {
+                    if (trackUid == msg.trackStopped.trackUid || msg.trackStopped.trackUid.isEmpty()) {
                         trackUid = ""
                         queue.clear()
+                        filter.reset()
                     }
                     val f = stopWait
                     stopWait = null
@@ -430,25 +452,25 @@ class TrackingClient internal constructor(
                 fut?.complete(Unit)
                 recvCh.trySend(msg)
             }
-            ServerMsg.BodyCase.LOCATION_ADDED -> {
+            msg.ack != null -> {
                 mutex.withLock {
-                    if (msg.locationAdded.clientSeq > lastAckedSeq) {
-                        lastAckedSeq = msg.locationAdded.clientSeq
-                    }
-                    queue.ackThrough(msg.locationAdded.clientSeq)
+                    if (msg.ack.seq > lastAckedSeq) lastAckedSeq = msg.ack.seq
+                    queue.ackThrough(msg.ack.seq)
+                    unackedFrames = 0
                 }
-                recvCh.trySend(msg)
+                flushStaging()
             }
-            ServerMsg.BodyCase.COMMAND -> {
-                cmdCh.trySend(msg.command)
-            }
-            ServerMsg.BodyCase.ERROR -> {
+            msg.command != null -> cmdCh.trySend(msg.command)
+            msg.error != null -> {
                 val err = errorFromWire(msg.error)
                 mutex.withLock {
                     resumeWait?.let {
                         if (isFatalResumeError(err.code)) {
                             trackUid = ""
                             queue.clear()
+                            filter.reset()
+                            clientSeq = 0
+                            lastAckedSeq = 0
                         }
                         it.completeExceptionally(err)
                         resumeWait = null
@@ -458,10 +480,23 @@ class TrackingClient internal constructor(
                     } ?: stopWait?.let {
                         it.completeExceptionally(err)
                         stopWait = null
+                    } ?: run {
+                        if (err.code == ErrorCode.TRACK_NOT_FOUND) {
+                            trackUid = ""
+                            queue.clear()
+                            filter.reset()
+                        }
                     }
                 }
-                if (isAuthError(err.code)) {
-                    scope.launch { handleAuthError() }
+                if (isAuthError(err.code)) scope.launch { handleAuthError() }
+                recvCh.trySend(msg)
+            }
+            msg.subscribed != null -> {
+                mutex.withLock {
+                    if (subscriptions.containsKey(msg.subscribed.deviceUid)) {
+                        subscriptions[msg.subscribed.deviceUid] = msg.subscribed.sub
+                        subByHandle[msg.subscribed.sub] = msg.subscribed.deviceUid
+                    }
                 }
                 recvCh.trySend(msg)
             }
@@ -469,7 +504,7 @@ class TrackingClient internal constructor(
         }
     }
 
-    private suspend fun handleRelocate(rel: io.pickpoint.tracking.v2.Relocate, sendResume: Boolean) {
+    private suspend fun handleRelocate(rel: Relocate, sendResume: Boolean) {
         var resume = sendResume
         if (rel.endpoint.isNotEmpty()) {
             mutex.withLock { cfg = cfg.copy(endpoint = rel.endpoint) }
@@ -504,12 +539,8 @@ class TrackingClient internal constructor(
         }
         val sendResume: Boolean
         mutex.withLock {
-            if (result.device != null) {
-                cfg = cfg.copy(device = result.device, listener = null)
-            }
-            if (result.listener != null) {
-                cfg = cfg.copy(listener = result.listener, device = null)
-            }
+            if (result.device != null) cfg = cfg.copy(device = result.device, listener = null)
+            if (result.listener != null) cfg = cfg.copy(listener = result.listener, device = null)
             sendResume = trackUid.isNotEmpty()
             if (intentional.get()) return
             dialGen += 1
@@ -530,6 +561,7 @@ class TrackingClient internal constructor(
         mutex.withLock {
             if (gen != dialGen) return
             webSocket = null
+            unackedFrames = 0
             if (intentional.get()) {
                 state = ConnectionState.CLOSED
                 return
@@ -543,7 +575,6 @@ class TrackingClient internal constructor(
             shouldReconnect = true
         }
         if (shouldReconnect) {
-            // Schedule outside the mutex so dial never races with this lock.
             mutex.withLock { scheduleReconnectLocked() }
         }
     }
@@ -563,7 +594,6 @@ class TrackingClient internal constructor(
         reconnectJob = scope.launch {
             delay(delayDur.toMillis())
             if (intentional.get()) return@launch
-            // Clear before dial() — dial cancels reconnectJob and must not cancel itself.
             mutex.withLock { reconnectJob = null }
             try {
                 dial(sendResume = sendResume)
@@ -579,6 +609,7 @@ class TrackingClient internal constructor(
     }
 
     private fun rejectPending(err: Exception) {
+        starting = false
         startWait?.completeExceptionally(err)
         startWait = null
         stopWait?.completeExceptionally(err)
@@ -593,10 +624,13 @@ class TrackingClient internal constructor(
     }
 
     private suspend fun resubscribe() {
-        val subs = mutex.withLock { subscriptions.toList() }
+        val subs = mutex.withLock {
+            subByHandle.clear()
+            subscriptions.keys.toList()
+        }
         for (d in subs) {
             try {
-                send(ClientMsg.newBuilder().setSubscribe(Subscribe.newBuilder().setDeviceUid(d)).build())
+                send(ClientMsg(subscribe = Subscribe(d, includeEvents = true)))
             } catch (_: Exception) {
             }
         }
@@ -610,30 +644,53 @@ class TrackingClient internal constructor(
             Triple(trackUid, clientSeq, f)
         }
         try {
-            send(
-                ClientMsg.newBuilder()
-                    .setResume(Resume.newBuilder().setTrackUid(uid).setLastClientSeq(seq))
-                    .build(),
-            )
+            send(ClientMsg(resume = Resume(uid, seq)))
         } catch (e: Exception) {
             mutex.withLock { resumeWait = null }
             throw e
         }
-        fut.await()
+        try {
+            fut.await()
+        } catch (e: TrackingException) {
+            if (isRetryResumeError(e.code)) {
+                delay(50)
+                sendResumeAndWait()
+                return
+            }
+            throw e
+        }
     }
 
-    private suspend fun flushQueue() {
-        val (uid, pending, open) = mutex.withLock {
-            Triple(trackUid, queue.peekAll(), state == ConnectionState.OPEN && webSocket != null)
+    private suspend fun resendInFlight() {
+        val (open, pts) = mutex.withLock {
+            (state == ConnectionState.OPEN && webSocket != null && trackUid.isNotEmpty()) to queue.peekAll()
         }
-        if (uid.isEmpty() || !open || pending.isEmpty()) return
-        val batch = LocationBatch.newBuilder()
-            .setTrackUid(uid)
-            .setClientSeq(pending.last().seq)
-        pending.forEach { batch.addPoints(it.point) }
-        try {
-            send(ClientMsg.newBuilder().setLocationBatch(batch).build())
-        } catch (_: Exception) {
+        if (!open || pts.isEmpty()) return
+        val frames = encodeInFlightFrames(pts)
+        mutex.withLock { unackedFrames += frames.size }
+        for (f in frames) {
+            webSocket?.send(f.toByteString())
+        }
+    }
+
+    private suspend fun flushStaging() {
+        val assigned = mutex.withLock {
+            val open = state == ConnectionState.OPEN && webSocket != null && trackUid.isNotEmpty()
+            val window = MAX_IN_FLIGHT_FRAMES - unackedFrames
+            if (!open || window <= 0) return@withLock emptyList()
+            val points = queue.takeStaging(window * 100)
+            points.map {
+                clientSeq += 1
+                val q = QueuedPoint(clientSeq, it, sent = false)
+                queue.pushInFlight(q.seq, q.point)
+                q
+            }
+        }
+        if (assigned.isEmpty()) return
+        val frames = encodeInFlightFrames(assigned)
+        mutex.withLock { unackedFrames += frames.size }
+        for (f in frames) {
+            webSocket?.send(f.toByteString())
         }
     }
 
@@ -649,14 +706,15 @@ class TrackingClient internal constructor(
                 throw TrackingException(message = "Device or Listener auth is required")
             }
             val client = TrackingClient(config)
+            for (uid in config.subscribe) {
+                if (uid.isNotEmpty()) client.subscriptions[uid] = 0
+            }
             client.dial(sendResume = false)
             return client
         }
     }
 }
 
-/** Kotlin-friendly connect. */
 suspend fun connect(config: Config): TrackingClient = TrackingClient.connectSuspend(config)
 
-/** Blocking connect for Java. */
 fun connectBlocking(config: Config): TrackingClient = TrackingClient.connect(config)

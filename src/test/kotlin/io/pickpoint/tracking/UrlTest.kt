@@ -14,7 +14,7 @@ class UrlTest {
             ),
         )
         assertEquals("https", url.scheme)
-        assertEquals("/v2/tracking/ws", url.encodedPath)
+        assertEquals("/v2/ws", url.encodedPath)
         assertEquals("id", url.queryParameter("client-id"))
         assertEquals("secret", url.queryParameter("client-secret"))
     }
