@@ -172,7 +172,7 @@ signingInMemoryKeyPassword=<gpg passphrase>
 ./gradlew publishToMavenCentral
 ```
 
-**GitHub Actions** — push to `main` auto-bumps patch in `VERSION`, tags `vX.Y.Z`, publishes to Maven Central, and creates a GitHub Release. Manual tag `v*` also publishes (skips if already on Central).
+**GitHub Actions** — merge `dev` → `main` auto-bumps patch in `VERSION`, tags `vX.Y.Z`, publishes to Maven Central, and creates a GitHub Release. Manual tag `v*` also publishes (skips if already on Central).
 
 Repo secrets (Settings → Secrets and variables → Actions):
 
@@ -184,7 +184,11 @@ Repo secrets (Settings → Secrets and variables → Actions):
 | `SIGNING_KEY_ID` | `8869B5C7` or long id `03AB60E58869B5C7` |
 | `SIGNING_PASSWORD` | GPG key passphrase (same as `signingInMemoryKeyPassword`) |
 
-Skip auto-release on a commit: include `[skip release]` in the message. For a minor/major bump, edit `VERSION` in a PR with `[skip release]`, merge, then tag/push or let the next main push continue from there.
+Skip auto-release on a commit: include `[skip release]` in the message. For a minor/major bump, edit `VERSION` in a PR to `dev` with `[skip release]`, merge to `main`, then tag/push or let the next `main` push continue from there.
 
 Artifact: `io.pickpoint:pickpoint` (version from `VERSION`).
+
+## Contributing
+
+Fork and open a PR against **`dev`**. [CONTRIBUTING.md](CONTRIBUTING.md).
 
