@@ -92,23 +92,25 @@ A dropped socket is not a new trip. The SDK reconnects and **Resumes** the same 
 
 First `publish` starts the trip if none is live. `close` sends `TrackStop` then hangs up. Call `startTrack` only to supersede (new order / `TRACK_NOT_FOUND`) or to set a route.
 
+From a coroutine (`suspend` / `viewModelScope` / `runBlocking`):
+
 ### Device (publisher)
 
 ```kotlin
 import io.pickpoint.tracking.Config
 import io.pickpoint.tracking.DeviceAuth
-import io.pickpoint.tracking.connectBlocking
+import io.pickpoint.tracking.connect
 import io.pickpoint.tracking.latLng
 
-val session = connectBlocking(
+val session = connect(
     Config(
         endpoint = "wss://tracking.pickpoint.io",
         device = DeviceAuth(clientId = deviceUid, clientSecret = deviceSecret),
     ),
 )
 
-session.publishBlocking(latLng(55.75, 37.61)) // TrackStart if idle
-session.closeBlocking() // TrackStop + hang up
+session.publish(latLng(55.75, 37.61)) // TrackStart if idle
+session.close() // TrackStop + hang up
 ```
 
 ### Listener (dashboard)
@@ -119,14 +121,14 @@ The JWT is the **client-token** `accessToken` — same one as HTTP `clientAuth`.
 import io.pickpoint.mintClientTokens
 import io.pickpoint.tracking.Config
 import io.pickpoint.tracking.ListenerAuth
-import io.pickpoint.tracking.connectBlocking
+import io.pickpoint.tracking.connect
 
 val pair = mintClientTokens(
     io.pickpoint.Config(apiKey = System.getenv("PICKPOINT_API_KEY")),
     listOf("devices"),
     600,
 )
-val session = connectBlocking(
+val session = connect(
     Config(
         endpoint = "wss://tracking.pickpoint.io",
         listener = ListenerAuth(accessToken = pair.accessToken),
@@ -134,13 +136,14 @@ val session = connectBlocking(
     ),
 )
 
-while (true) {
-    val msg = session.recvBlocking()
-    msg.loc?.let { println("${it.point.latitude} ${it.point.longitude}") }
+session.onLocation { loc ->
+    println("${loc.point.latitude} ${loc.point.longitude}")
 }
 ```
 
-Coroutine APIs (`connect`, `startTrack`, `publish`, `recv`, …) are the same surface without `Blocking`.
+`connect` is `suspend` (waits for Hello). `publish` / `close` / `onLocation` are regular functions — no coroutine needed on the GPS path. Java: `TrackingClient.connectAsync(cfg)` returns `CompletableFuture`; `connect` / `connectBlocking` wait on the calling thread.
+
+`startTrack` / `stopTrack` / `recv` stay `suspend` (they wait on the server). `*Blocking` twins remain for Java callers that want a blocking wait.
 
 Wire format: [pickpoint-proto](https://github.com/pickpoint/pickpoint-proto).
 

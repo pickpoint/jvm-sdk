@@ -58,7 +58,7 @@ class TrackingClientTest {
             try {
                 c.startTrack()
                 assertThrows(TrackingException::class.java) {
-                    runBlocking { c.sendEvent(ByteArray(MAX_EVENT_BYTES + 1)) }
+                    c.sendEvent(ByteArray(MAX_EVENT_BYTES + 1))
                 }
                 assertTrue(c.sendEvent("a".toByteArray()))
                 assertFalse(c.sendEvent("b".toByteArray()))
